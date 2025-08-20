@@ -2,12 +2,14 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributions import Normal
 import numpy as np
 from torchaudio.models.rnnt import _Transcriber
 from typing import List, Optional, Tuple
 from model import tokenizer
 from pathlib import Path
 
+# TODO Make an MEA Transcriber
 
 class GaussianSmoother(nn.Module):
     
@@ -149,6 +151,109 @@ class CNNLSTMTranscriber(nn.Module, _Transcriber):
         return logits, lengths, states
 
 BaseTranscriber = CNNLSTMTranscriber
+
+
+class TemporalUnfold1D(nn.Module):
+    def __init__(self, window_size: int = 6, stride: int = 2, gaussian_sigma: float = None):
+        super().__init__()
+        self.window_size = window_size
+        self.stride = stride
+        if gaussian_sigma is not None:
+            support = torch.arange(-(window_size-1)//2, (window_size-1)//2 + 1, dtype=torch.float)
+            weights = Normal(loc=0, scale=gaussian_sigma).log_prob(support).exp_()
+            weights = weights / weights.sum()
+            self.register_buffer('gaussian_window', weights)
+        else:
+            self.gaussian_window = None
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor):
+        # x: (B, T, C)
+        B, T, C = x.shape
+        xt = x.permute(0, 2, 1).unsqueeze(2)  # (B, C, 1, T)
+        patches = F.unfold(xt, kernel_size=(1, self.window_size), stride=(1, self.stride))  # (B, C*W, T')
+        if self.gaussian_window is not None:
+            patches = patches.view(B, C, self.window_size, -1)
+            patches = patches * self.gaussian_window.view(1, 1, self.window_size, 1)
+            patches = patches.view(B, C * self.window_size, -1)
+        out = patches.permute(0, 2, 1)  # (B, T', C*W)
+        # new lengths: floor((L - W)/stride + 1), clamp to >=0
+        new_lengths = torch.floor_divide(lengths - self.window_size, self.stride) + 1
+        new_lengths = torch.clamp(new_lengths, min=0)
+        return out, new_lengths
+
+
+class MEATranscriber(nn.Module, _Transcriber):
+    def __init__(self,
+                input_dim: int = 512,
+                unfold_window_size: int = 6,
+                unfold_stride: int = 2,
+                gaussian_sigma: float = 1.0,
+                proj_dim: int = 512,
+                dropout: float = 0.2,
+                rnn_hidden_dim: int = 512,
+                rnn_num_layers: int = 3,
+                bidirectional: bool = False,
+                cnn_kernel_size: int = 3,
+                cnn_stride: int = 2,
+                post_linear_dim: int = 512,
+                output_dim: int = 1024,
+                ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.unfold = TemporalUnfold1D(window_size=unfold_window_size, stride=unfold_stride, gaussian_sigma=gaussian_sigma)
+        self.project = nn.Sequential(
+            nn.Linear(input_dim * unfold_window_size, proj_dim),
+            nn.Dropout(dropout),
+        )
+        self.rnn = nn.GRU(proj_dim, rnn_hidden_dim, rnn_num_layers, batch_first=True, dropout=dropout, bidirectional=bidirectional)
+        rnn_out_dim = rnn_hidden_dim * (2 if bidirectional else 1)
+        self.cnn = nn.Conv1d(rnn_out_dim, rnn_out_dim, kernel_size=cnn_kernel_size, stride=cnn_stride, padding=cnn_kernel_size // 2)
+        self.post = nn.Sequential(
+            nn.Linear(rnn_out_dim, post_linear_dim),
+            nn.Dropout(dropout),
+            nn.Linear(post_linear_dim, output_dim),
+        )
+        self.output_dim = output_dim
+        self.unfold_window_size = unfold_window_size
+        self.unfold_stride = unfold_stride
+        self.cnn_kernel_size = cnn_kernel_size
+        self.cnn_stride = cnn_stride
+        self.cnn_padding = cnn_kernel_size // 2
+
+    def _update_lengths_after_conv(self, lengths: torch.Tensor) -> torch.Tensor:
+        # Formula for Conv1d output length: floor((L + 2p - d*(k-1) - 1)/s + 1)
+        L = lengths
+        p = self.cnn_padding
+        k = self.cnn_kernel_size
+        s = self.cnn_stride
+        new_L = torch.floor_divide(L + 2 * p - (k - 1) - 1, s) + 1
+        new_L = torch.clamp(new_L, min=0)
+        return new_L
+
+    def forward(self, input: torch.Tensor, lengths: torch.Tensor, output_features: bool = False):
+        # input: (B, T, C)
+        features, lengths = self.unfold(input, lengths)
+        features = self.project(features)
+        outputs, _ = self.rnn(features)
+        x = outputs.permute(0, 2, 1)
+        x = self.cnn(x)
+        lengths = self._update_lengths_after_conv(lengths)
+        x = x.permute(0, 2, 1)
+        logits = self.post(x)
+        if output_features:
+            return logits, lengths, features
+        return logits, lengths
+
+    def infer(self, input: torch.Tensor, lengths: torch.Tensor, states=None):
+        features, lengths = self.unfold(input, lengths)
+        features = self.project(features)
+        outputs, states = self.rnn(features, states)
+        x = outputs.permute(0, 2, 1)
+        x = self.cnn(x)
+        lengths = self._update_lengths_after_conv(lengths)
+        x = x.permute(0, 2, 1)
+        logits = self.post(x)
+        return logits, lengths, states
 
 class DummyTranscriber(nn.Module, _Transcriber):
     def __init__(self,input_dim):
