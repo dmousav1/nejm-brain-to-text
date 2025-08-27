@@ -195,7 +195,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_rnnt', action='store_true', help='Train RNNT instead of baseline GRU-CTC')
     cli_args, _ = parser.parse_known_args()
 
-    args = OmegaConf.load('rnn_args.yaml')
+    args = OmegaConf.load('model_training/rnn_args.yaml')
 
     train_rnnt_from_hdf5(args)
 
