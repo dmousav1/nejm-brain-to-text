@@ -51,6 +51,7 @@ class MunitRNNT(nn.Module):
             blank_id=config_bundle['predictor_configs']['num_symbols']-1
             if target == 'unit':
                 if 'tokenizer_type' in config_bundle.keys():
+                    tokenizer_type = config_bundle['tokenizer_type']
                     if tokenizer_type == 'HB':
                         tokenizer = HuBERTTokenizer(**config_bundle['tokenizer_configs'])
                     else:
