@@ -6,6 +6,8 @@ import torch
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 import lightning as pl
+import json
+from lightning.pytorch.callbacks import ModelCheckpoint
 
 # RNNT model components
 from model.ecog2speech_rnnt import SpeechModel
@@ -87,6 +89,16 @@ def train_rnnt_from_hdf5(args):
 
     if len(train_examples) == 0:
         raise RuntimeError(f'No train HDF5 trials found under {data_root}.')
+
+    # Where to save artifacts (splits + checkpoints)
+    output_dir = args.get('output_dir', 'trained_models/rnnt')
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Persist the dataset splits for quick DataLoader reconstruction
+    with open(os.path.join(output_dir, 'train_examples.json'), 'w') as f:
+        json.dump(train_examples, f)
+    with open(os.path.join(output_dir, 'val_examples.json'), 'w') as f:
+        json.dump(val_examples, f)
 
     # Compute vocab size from label IDs for tokenizer/predictor alignment
     max_id = _compute_max_target_id(train_examples)
@@ -177,14 +189,27 @@ def train_rnnt_from_hdf5(args):
         except Exception:
             devices = 1
 
-    max_epochs = 1  # fallback; RNNT often uses many steps; control via batches per epoch
+    # Per-epoch checkpointing
+    ckpt_dir = os.path.join(output_dir, 'checkpoints')
+    os.makedirs(ckpt_dir, exist_ok=True)
+    ckpt_cb = ModelCheckpoint(
+        dirpath=ckpt_dir,
+        filename='epoch{epoch:03d}-step{step:06d}',
+        save_top_k=-1,
+        every_n_epochs=1,
+        save_last=True,
+        monitor=None,
+    )
+
+    max_epochs = 10 # fallback; RNNT often uses many steps; control via batches per epoch
     trainer = pl.Trainer(
         accelerator='gpu' if devices is not None else 'cpu',
         devices=devices,
         max_epochs=max_epochs,
         log_every_n_steps=50,
         gradient_clip_val=float(args.get('grad_norm_clip_value', 1.0)),
-        default_root_dir=args.get('output_dir', 'trained_models/rnnt')
+        default_root_dir=output_dir,
+        callbacks=[ckpt_cb],
     )
 
     trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
