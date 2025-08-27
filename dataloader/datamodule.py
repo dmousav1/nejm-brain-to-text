@@ -1,172 +1,200 @@
-import numpy as np
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-import pytorch_lightning as pl
-from pathlib import Path
-import tqdm
-import random
-import csv
-import soundfile as sf
-import string
+import os
 import re
+from pathlib import Path
+from typing import Dict, List, Optional
 
-from transformers import Wav2Vec2Processor
-processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
+import h5py
+import numpy as np
+import pytorch_lightning as pl
+import torch
+from torch.utils.data import DataLoader, Dataset
 
-class SpeechTextDataset(Dataset):
-    
-    def __init__(self, data, skip_text=False, max_len=None, label_sr=50):
+
+class MEAHDF5Dataset(Dataset):
+    """
+    Map-style dataset that reads MEA feature trials from native HDF5 and returns
+    RNNT-ready items (inputs, targets, and their lengths).
+    Each item corresponds to a single trial.
+    """
+
+    def __init__(
+        self,
+        examples: List[Dict],
+        feature_subset: Optional[List[int]] = None,
+    ):
         super().__init__()
-        self.data = data
-        self.skip_text = skip_text
-        self.max_len = max_len
-        self.label_sr = label_sr
-        
-    def __len__(self):
-        return len(self.data)
-    
-    def __getitem__(self,i):
-        flac_path, text = self.data[i]
-        wav,sr = sf.read(flac_path)
-        if self.max_len is not None:
-            wav = wav[:int(self.max_len*16000)]
-            text = ' '.join(text.split(' ')[:int(self.max_len*self.label_sr)])
-        assert sr ==16000
-        output = {'wav':wav,
-                  'text': text}
-        
-        return output
-    
+        self.examples = examples
+        self.feature_subset = feature_subset
+
+    def __len__(self) -> int:
+        return len(self.examples)
+
+    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+        ex = self.examples[index]
+        session_path: str = ex["session_path"]
+        trial_idx: int = ex["trial_idx"]
+        day_idx: int = ex["day_idx"]
+
+        with h5py.File(session_path, "r") as f:
+            g = f[f"trial_{trial_idx:04d}"]
+            features = g["input_features"][:]
+            if self.feature_subset is not None and len(self.feature_subset) > 0:
+                features = features[:, self.feature_subset]
+            targets = g["seq_class_ids"][:]
+
+            # Optional metadata
+            block_num = g.attrs.get("block_num", -1)
+            trial_num = g.attrs.get("trial_num", -1)
+
+        features_tensor = torch.from_numpy(features).float()  # [T, C]
+        targets_tensor = torch.from_numpy(targets).long()  # [U]
+
+        item = {
+            "inputs": features_tensor,
+            "targets": targets_tensor,
+            "input_length": torch.tensor(features_tensor.shape[0], dtype=torch.long),
+            "target_length": torch.tensor(targets_tensor.shape[0], dtype=torch.long),
+            "day_index": torch.tensor(day_idx, dtype=torch.long),
+            "block_num": torch.tensor(block_num, dtype=torch.long),
+            "trial_num": torch.tensor(trial_num, dtype=torch.long),
+        }
+        return item
+
     @staticmethod
-    def collate(batch):
-        data = {}
-        data['texts'] = [d['text'] for d in batch]
-        
-        wav_input = processor([d['wav'] for d in batch],
-                                   sampling_rate=16000, return_tensors="pt",
-                                   padding=True)
-        
-        data['wavs'] = wav_input.input_values.detach()
-        data['wav_lens'] = np.array([len(d['wav']) for d in batch])
-        return data
-    
-                  
-        
+    def collate(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        # Inputs: list of [T_i, C]
+        inputs = [b["inputs"] for b in batch]
+        input_lengths = torch.tensor([x.shape[0] for x in inputs], dtype=torch.long)
+        inputs_padded = torch.nn.utils.rnn.pad_sequence(
+            inputs, batch_first=True, padding_value=0.0
+        )  # [B, T_max, C]
 
-class SpeechTextDataModule(pl.LightningDataModule):
-    def __init__(self,
-                 root_dir,
-                 transcription='transctiption',
-                 labellen_file=None,
-                 labellen_thr=None,
-                 max_len=None,
-                 label_sr=None,
-                 batch_size=64,
-                 val_batch_size=None,
-                 num_workers=4,
-                 drop_last=True,
-                 pin_memory=True,
-                 
-                 ):
+        # Targets: list of [U_i]
+        targets = [b["targets"] for b in batch]
+        target_lengths = torch.tensor([t.shape[0] for t in targets], dtype=torch.long)
+        targets_padded = torch.nn.utils.rnn.pad_sequence(
+            targets, batch_first=True, padding_value=0
+        )  # [B, U_max]
+
+        out = {
+            "inputs": inputs_padded,
+            "input_lengths": input_lengths,
+            "targets": targets_padded,
+            "target_lengths": target_lengths,
+            "day_indices": torch.stack([b["day_index"] for b in batch]),
+            "block_nums": torch.stack([b["block_num"] for b in batch]),
+            "trial_nums": torch.stack([b["trial_num"] for b in batch]),
+        }
+        return out
+
+
+class MEAHDF5DataModule(pl.LightningDataModule):
+    """
+    Lightning DataModule that builds RNNT-ready DataLoaders from native MEA HDF5 files.
+
+    Expects a directory structure like:
+        dataset_dir/<session>/data_train.hdf5
+        dataset_dir/<session>/data_val.hdf5
+        (optional) dataset_dir/<session>/data_test.hdf5
+    """
+
+    def __init__(
+        self,
+        dataset_dir: str,
+        sessions: List[str],
+        batch_size: int = 64,
+        val_batch_size: Optional[int] = None,
+        num_workers: int = 4,
+        drop_last: bool = True,
+        pin_memory: bool = True,
+        feature_subset: Optional[List[int]] = None,
+    ):
         super().__init__()
-        
-        
-        self.root_dir = Path(root_dir)
-        self.transcription = transcription
-        self.batch_size=batch_size
+        self.dataset_dir = Path(dataset_dir)
+        self.sessions = sessions
+        self.batch_size = batch_size
+        self.val_batch_size = batch_size if val_batch_size is None else val_batch_size
+        self.num_workers = num_workers
         self.drop_last = drop_last
         self.pin_memory = pin_memory
-        self.num_workers = num_workers
-        self.val_batch_size = batch_size if val_batch_size is None else val_batch_size
-        self.do_regularize = self.transcription=='transcription'
-        if labellen_file is not None:
-            with open(labellen_file, 'r') as f:
-                len_tags =f.readlines()
-            self.tag2labellen = {}
-            for len_tag in len_tags:
-                len_,tag = len_tag.split(' ')
-                tag = tag.rstrip()
-                self.tag2labellen[tag]=int(len_)
-        else:
-            self.tag2labellen = None
-        self.labellen_thr= labellen_thr
-        self.max_len = None
-        self.label_sr = None
-        
-    def _load_data(self, split):
-        split_names={'train':  ['train-clean-100', 'train-clean-360', 'train-other-500'],
-                    'valid':['dev-clean'],
-                    'test':['test-clean','test-other']}[split]
-        
-        data = []
-        for split_name in split_names:
-            texts=[]
-            with open(str(self.root_dir/self.transcription/f'{split_name}.transcription.txt'), 'r') as f:
-                texts = f.readlines()
-            texts = [text.rstrip() for text in texts]
+        self.feature_subset = feature_subset
 
-            tags=[]
-            with open(str(self.root_dir/self.transcription/f'{split_name}.tag.txt'), 'r') as f:
-                tags = f.readlines()
-            tags = [tag.rstrip() for tag in tags]
-            regex = re.compile('[%s]' % re.escape(string.punctuation))
-            for tag,text in zip(tags, texts):
-                len_, tag=tag.split(' ')
-                if self.labellen_thr is not None:
-                    if self.tag2labellen[tag]> self.labellen_thr:
-                        continue
-                if int(len_)>200000:
+        self._train_examples: Optional[List[Dict]] = None
+        self._val_examples: Optional[List[Dict]] = None
+        self._test_examples: Optional[List[Dict]] = None
+
+    def _gather_examples(self, split: str) -> List[Dict]:
+        assert split in {"train", "val", "test"}
+        examples: List[Dict] = []
+        for day_idx, sess in enumerate(self.sessions):
+            h5_name = {
+                "train": "data_train.hdf5",
+                "val": "data_val.hdf5",
+                "test": "data_test.hdf5",
+            }[split]
+            h5_path = self.dataset_dir / sess / h5_name
+            if not h5_path.exists():
+                # Allow missing test split; skip silently
+                if split == "test":
                     continue
-                if self.do_regularize:
-                    text = regex.sub('', text.lower())
-                data.append([str(self.root_dir/tag)+'.flac', text])
-        return data
-    
-    
-    
+                raise FileNotFoundError(f"Missing HDF5 file for {split}: {h5_path}")
+
+            with h5py.File(str(h5_path), "r") as f:
+                # trial_0000, trial_0001, ...
+                for key in f.keys():
+                    if re.match(r"^trial_\\d{4}$", key):
+                        trial_idx = int(key.split("_")[1])
+                        examples.append(
+                            {
+                                "session_path": str(h5_path),
+                                "trial_idx": trial_idx,
+                                "day_idx": day_idx,
+                            }
+                        )
+        return examples
+
+    def setup(self, stage: Optional[str] = None) -> None:
+        if stage in (None, "fit"):
+            if self._train_examples is None:
+                self._train_examples = self._gather_examples("train")
+            if self._val_examples is None:
+                self._val_examples = self._gather_examples("val")
+        if stage in (None, "test"):
+            if self._test_examples is None:
+                self._test_examples = self._gather_examples("test")
+
     def train_dataloader(self) -> DataLoader:
-        
-        data = self._load_data('train')
-        dataset = SpeechTextDataset(data,max_len=self.max_len,label_sr=self.label_sr)
-        loader = DataLoader(
+        dataset = MEAHDF5Dataset(self._train_examples, feature_subset=self.feature_subset)
+        return DataLoader(
             dataset,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
             drop_last=self.drop_last,
             pin_memory=self.pin_memory,
-            collate_fn=SpeechTextDataset.collate
+            collate_fn=MEAHDF5Dataset.collate,
         )
-        return loader
-    
+
     def val_dataloader(self) -> DataLoader:
-        
-        data = self._load_data('valid')
-        dataset = SpeechTextDataset(data,max_len=self.max_len,label_sr=self.label_sr)
-        loader = DataLoader(
+        dataset = MEAHDF5Dataset(self._val_examples, feature_subset=self.feature_subset)
+        return DataLoader(
             dataset,
             batch_size=self.val_batch_size,
             shuffle=False,
             num_workers=self.num_workers,
             drop_last=self.drop_last,
             pin_memory=self.pin_memory,
-            collate_fn=SpeechTextDataset.collate
+            collate_fn=MEAHDF5Dataset.collate,
         )
-        return loader
-    
+
     def test_dataloader(self) -> DataLoader:
-        
-        data = self._load_data('test')
-        dataset = SpeechTextDataset(data)
-        loader = DataLoader(
+        dataset = MEAHDF5Dataset(self._test_examples or [], feature_subset=self.feature_subset)
+        return DataLoader(
             dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
             drop_last=False,
             pin_memory=self.pin_memory,
-            collate_fn=SpeechTextDataset.collate
+            collate_fn=MEAHDF5Dataset.collate,
         )
-        return loader
-    
