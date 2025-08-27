@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import h5py
 import torch
 import numpy as np
@@ -8,76 +9,64 @@ import lightning as pl
 
 # RNNT model components
 from model.ecog2speech_rnnt import SpeechModel
-from model.tokenizer import GraphemeTokenizer
+from dataloader.datamodule import MEAHDF5Dataset
 
 from omegaconf import OmegaConf
 from rnn_trainer import BrainToTextDecoder_Trainer
 
 
-class HDF5RNNTDataset(Dataset):
-    """
-    Minimal dataset that reads trials from Brain-To-Text HDF5 files and
-    returns samples in the format expected by the RNNT pipeline:
-      - ecog: FloatTensor [T, C]
-      - ecog_len: int
-      - text: dict with key 'phoneme' holding a plain string transcription
-    """
-    def __init__(self, file_paths):
-        super().__init__()
-        self.index = []  # list of (file_path, trial_key)
-        for fp in file_paths:
-            if not os.path.exists(fp):
+def _gather_examples(dataset_dir, sessions, split):
+    assert split in {"train", "val"}
+    examples = []
+    for day_idx, sess in enumerate(sessions):
+        h5_name = {"train": "data_train.hdf5", "val": "data_val.hdf5"}[split]
+        h5_path = os.path.join(dataset_dir, sess, h5_name)
+        if not os.path.exists(h5_path):
+            if split == 'val':
                 continue
-            try:
-                with h5py.File(fp, 'r') as f:
-                    for key in f.keys():
-                        g = f[key]
-                        # require neural features and either transcription or seq_class_ids
-                        if 'input_features' not in g:
-                            continue
-                        if 'transcription' in g or 'seq_class_ids' in g:
-                            self.index.append((fp, key))
-            except Exception:
-                continue
+            raise FileNotFoundError(f"Missing HDF5 file for {split}: {h5_path}")
+        with h5py.File(h5_path, 'r') as f:
+            for key in f.keys():
+                if re.match(r"^trial_\d{4}$", key):
+                    trial_idx = int(key.split('_')[1])
+                    examples.append({
+                        'session_path': h5_path,
+                        'trial_idx': trial_idx,
+                        'day_idx': day_idx,
+                    })
+    return examples
 
-    def __len__(self):
-        return len(self.index)
 
-    def __getitem__(self, i):
-        fp, key = self.index[i]
-        with h5py.File(fp, 'r') as f:
-            g = f[key]
-            feats = g['input_features'][:].astype(np.float32)
-            # Prefer character-level transcription when available
-            if 'transcription' in g:
-                trans = g['transcription'][:]
-                if isinstance(trans, (bytes, bytearray, np.bytes_)):
-                    text = trans.decode('utf-8', errors='ignore')
-                else:
-                    try:
-                        text = ''.join([t.decode('utf-8', errors='ignore') if isinstance(t, (bytes, bytearray, np.bytes_)) else str(t) for t in trans])
-                    except Exception:
-                        text = str(trans)
-            else:
-                # Fallback: integer seq_class_ids -> join as space-separated numbers to form a stable string
-                ids = g['seq_class_ids'][:]
-                text = ' '.join([str(int(x)) for x in ids])
+def _compute_max_target_id(examples):
+    max_id = 0
+    for ex in examples:
+        with h5py.File(ex['session_path'], 'r') as f:
+            g = f[f"trial_{ex['trial_idx']:04d}"]
+            if 'seq_class_ids' in g:
+                arr = g['seq_class_ids'][:]
+                if arr.size > 0:
+                    max_id = max(max_id, int(np.max(arr)))
+    return int(max_id)
 
-        return {
-            'ecog': torch.from_numpy(feats),
-            'ecog_len': feats.shape[0],
-            'text': {
-                # The RNNT bundle here is named 'phoneme' and expects this key
-                'phoneme': text
-            }
-        }
 
-    @staticmethod
-    def collate(batch):
-        ecogs = torch.nn.utils.rnn.pad_sequence([b['ecog'] for b in batch], batch_first=True, padding_value=0.0)
-        ecog_lens = torch.tensor([b['ecog_len'] for b in batch], dtype=torch.long)
-        texts = {'phoneme': [b['text']['phoneme'] for b in batch]}
-        return {'ecogs': ecogs, 'ecog_lens': ecog_lens, 'texts': texts}
+def rnnt_collate_from_mea(batch):
+    base = MEAHDF5Dataset.collate(batch)
+    # Convert targets to space-separated integers (strings) for tokenizer
+    targets = base['targets']  # [B, U_max]
+    lengths = base['target_lengths']  # [B]
+    unit_texts = []
+    for i in range(targets.shape[0]):
+        l = int(lengths[i].item())
+        ids = targets[i, :l].tolist()
+        unit_texts.append(' '.join(str(int(x)) for x in ids))
+    return {
+        'ecogs': base['inputs'],
+        'ecog_lens': base['input_lengths'],
+        'texts': {'unit': unit_texts},
+        # keep extra metadata if needed downstream
+        'block_nums': base.get('block_nums'),
+        'trial_nums': base.get('trial_nums'),
+    }
 
 
 def _list_h5_files(data_root, sessions, split_name):
@@ -90,37 +79,38 @@ def _list_h5_files(data_root, sessions, split_name):
 
 
 def train_rnnt_from_hdf5(args):
-    # Build train/val datasets from HDF5
+    # Build train/val datasets from HDF5 using MEA dataset schema
     data_root = args['dataset']['dataset_dir']
     sessions = args['dataset']['sessions']
-    train_files = _list_h5_files(data_root, sessions, 'train')
-    val_files = _list_h5_files(data_root, sessions, 'val')
+    train_examples = _gather_examples(data_root, sessions, 'train')
+    val_examples = _gather_examples(data_root, sessions, 'val')
 
-    if len(train_files) == 0:
-        raise RuntimeError(f'No train HDF5 files found under {data_root}.')
-    if len(val_files) == 0:
-        print('Warning: No val HDF5 files found. Validation will be skipped.')
+    if len(train_examples) == 0:
+        raise RuntimeError(f'No train HDF5 trials found under {data_root}.')
 
-    train_ds = HDF5RNNTDataset(train_files)
-    val_ds = HDF5RNNTDataset(val_files) if len(val_files) > 0 else None
+    # Compute vocab size from label IDs for tokenizer/predictor alignment
+    max_id = _compute_max_target_id(train_examples)
+    km_n = max_id + 1  # tokenizer.pad_id = km_n, tokenizer.blank = km_n+1
+    num_symbols = km_n + 2  # predictor vocab = pad + blank + ids
 
     batch_size = int(args['dataset'].get('batch_size', 32))
     num_workers = int(args['dataset'].get('num_dataloader_workers', 4))
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True, collate_fn=HDF5RNNTDataset.collate, drop_last=True)
+    train_ds = MEAHDF5Dataset(train_examples)
+    val_ds = MEAHDF5Dataset(val_examples) if len(val_examples) > 0 else None
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True, collate_fn=rnnt_collate_from_mea, drop_last=True)
     val_loader = None
     if val_ds is not None and len(val_ds) > 0:
-        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True, collate_fn=HDF5RNNTDataset.collate, drop_last=False)
-
-    # Derive vocabulary size from Grapheme tokenizer (no external g2p dependency)
-    tmp_tok = GraphemeTokenizer(include_space=True)
-    num_symbols = int(tmp_tok.blank) + 1  # final index is blank, symbols are 0..blank
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True, collate_fn=rnnt_collate_from_mea, drop_last=False)
 
     # RNNT model configs (simple, single-module bundle)
     bundle_configs = {
-        'phoneme': {
-            'tokenizer_type': 'GR',
+        'unit': {
+            'target': 'unit',
+            'tokenizer_type': 'HB',
             'tokenizer_configs': {
-                'include_space': True
+                'pre_tokenized': True,
+                'km_n': km_n,
+                'collapse': True
             },
             'transcriber_configs': {
                 'MODEL': 'MEATranscriber',
@@ -155,16 +145,14 @@ def train_rnnt_from_hdf5(args):
         }
     }
 
-    # Top-level feature "extractor" is identity to pass raw ECoG to transcriber
+    # Identity feature extractor; RNNT transcriber handles feature processing
     feature_extractor_configs = {
-        'MODEL': 'MEATranscriber',
+        'MODEL': 'DummyTranscriber',
         'input_dim': int(args['model']['n_input_features'])
     }
 
     loss_coef_instructions = {
-        'phoneme_rnnt_loss': {
-            'value': 1.0
-        }
+        'unit_rnnt_loss': {'value': 1.0}
     }
 
     model = SpeechModel(
