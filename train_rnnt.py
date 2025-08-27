@@ -12,7 +12,7 @@ from model.ecog2speech_rnnt import SpeechModel
 from dataloader.datamodule import MEAHDF5Dataset
 
 from omegaconf import OmegaConf
-from rnn_trainer import BrainToTextDecoder_Trainer
+from model_training.rnn_trainer import BrainToTextDecoder_Trainer
 
 
 def _gather_examples(dataset_dir, sessions, split):
