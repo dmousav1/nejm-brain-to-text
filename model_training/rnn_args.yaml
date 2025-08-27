@@ -14,7 +14,7 @@ model:
     input_trainable: true # whether the input layer is trainable
     input_layer_dropout: 0.2 # dropout rate for the input layer
 
-gpu_number: '1' # GPU number to use for training, formatted as a string (e.g., '0', '1', etc.)
+gpu_number: '0' # GPU number to use for training, formatted as a string (e.g., '0', '1', etc.)
 mode: train
 use_amp: true # whether to use automatic mixed precision (AMP) for training
 
