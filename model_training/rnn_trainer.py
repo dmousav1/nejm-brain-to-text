@@ -12,8 +12,8 @@ import sys
 import json
 import pickle
 
-from dataset import BrainToTextDataset, train_test_split_indicies
-from data_augmentations import gauss_smooth
+from model_training.dataset import BrainToTextDataset, train_test_split_indicies
+from model_training.data_augmentations import gauss_smooth
 
 import torchaudio.functional as F # for edit distance
 from omegaconf import OmegaConf
