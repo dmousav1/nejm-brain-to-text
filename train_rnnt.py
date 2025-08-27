@@ -91,7 +91,7 @@ def train_rnnt_from_hdf5(args):
         raise RuntimeError(f'No train HDF5 trials found under {data_root}.')
 
     # Where to save artifacts (splits + checkpoints)
-    output_dir = args.get('output_dir', 'trained_models/rnnt')
+    output_dir = args.get('output_dir', 'model_training/trained_models/rnnt')
     os.makedirs(output_dir, exist_ok=True)
 
     # Persist the dataset splits for quick DataLoader reconstruction
@@ -105,7 +105,7 @@ def train_rnnt_from_hdf5(args):
     km_n = max_id + 1  # tokenizer.pad_id = km_n, tokenizer.blank = km_n+1
     num_symbols = km_n + 2  # predictor vocab = pad + blank + ids
 
-    batch_size = int(args['dataset'].get('batch_size', 32))
+    batch_size = int(args['dataset'].get('batch_size', 32)) # Chooses 64 (in rnnt_args.yaml file) but if not found, defaults to 32
     num_workers = int(args['dataset'].get('num_dataloader_workers', 4))
     train_ds = MEAHDF5Dataset(train_examples)
     val_ds = MEAHDF5Dataset(val_examples) if len(val_examples) > 0 else None
@@ -220,7 +220,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_rnnt', action='store_true', help='Train RNNT instead of baseline GRU-CTC')
     cli_args, _ = parser.parse_known_args()
 
-    args = OmegaConf.load('model_training/rnn_args.yaml')
+    args = OmegaConf.load('model_training/rnnt_args.yaml')
 
     train_rnnt_from_hdf5(args)
 

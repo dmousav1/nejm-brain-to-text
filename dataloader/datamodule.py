@@ -39,15 +39,16 @@ class MEAHDF5Dataset(Dataset):
             g = f[f"trial_{trial_idx:04d}"]
             features = g["input_features"][:]
             if self.feature_subset is not None and len(self.feature_subset) > 0:
-                features = features[:, self.feature_subset]
-            targets = g["seq_class_ids"][:]
+                features = features[:, self.feature_subset] # Inputs: these are the input features that we want to use for training.
+            targets = g["seq_class_ids"][:] # Outputs: Class IDs of the ground truth phone labels. Effectively our output labels.
 
             # Optional metadata
             block_num = g.attrs.get("block_num", -1)
             trial_num = g.attrs.get("trial_num", -1)
 
-        features_tensor = torch.from_numpy(features).float()  # [T, C]
-        targets_tensor = torch.from_numpy(targets).long()  # [U]
+        features_tensor = torch.from_numpy(features).float()  # [T, C] T = time steps, C = number of features
+        targets_tensor = torch.from_numpy(targets).long()  # [U] U = number of output labels/phones
+        # We are converting the input features and output phone targets to PyTorch tensors.
 
         item = {
             "inputs": features_tensor,
